@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Recipe Search</title>
+    <style>
+        body { font-family: sans-serif; margin: 2em; background-color: #f4f4f4; color: #333; }
+        .container { max-width: 960px; margin: auto; background: white; padding: 2em; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        h1, h2 { color: #555; }
+        #search-bar { margin-bottom: 2em; }
+        #search-input { padding: 10px; width: 300px; border: 1px solid #ccc; border-radius: 4px; }
+        #search-button { padding: 10px 15px; border: none; background-color: #5cb85c; color: white; border-radius: 4px; cursor: pointer; }
+        #search-button:hover { background-color: #4cae4c; }
+        #batches-container { margin-bottom: 2em; }
+        .batch { display: inline-block; background-color: #f0ad4e; color: white; padding: 8px 12px; margin: 5px; border-radius: 4px; cursor: pointer; }
+        .batch:hover { background-color: #eea236; }
+        #recipes-list { list-style: none; padding: 0; }
+        #recipes-list li { margin-bottom: 1em; cursor: pointer; border: 1px solid #ddd; padding: 1em; border-radius: 4px; display: flex; align-items: center; }
+        #recipes-list li:hover { background-color: #f9f9f9; }
+        #recipes-list img { width: 100px; height: 100px; object-fit: cover; border-radius: 4px; margin-right: 1em; }
+        #recipe-details img { max-width: 100%; height: auto; border-radius: 8px; margin-bottom: 1em; }
+        #recipe-details ul, #recipe-details ol { padding-left: 20px; }
+        #back-button { padding: 10px 15px; border: none; background-color: #d9534f; color: white; border-radius: 4px; cursor: pointer; margin-top: 1em; }
+        #back-button:hover { background-color: #c9302c; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h1>Recipe Database</h1>
+
+        <div id="main-view">
+            <h2>Search for a Recipe</h2>
+            <div id="search-bar">
+                <input type="text" id="search-input" placeholder="e.g., Spaghetti">
+                <button id="search-button">Search</button>
+            </div>
+
+            <h2>Or, browse by Ingredient Batch</h2>
+            <div id="batches-container">
+                <p>Loading batches...</p>
+            </div>
+
+            <ul id="recipes-list"></ul>
+        </div>
+
+        <div id="recipe-details" class="hidden">
+            <!-- Recipe details will be injected here -->
+        </div>
+
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const searchInput = document.getElementById('search-input');
+            const searchButton = document.getElementById('search-button');
+            const batchesContainer = document.getElementById('batches-container');
+            const recipesList = document.getElementById('recipes-list');
+            const mainView = document.getElementById('main-view');
+            const recipeDetailsView = document.getElementById('recipe-details');
+
+            // Fetch and display ingredient batches
+            async function loadBatches() {
+                try {
+                    const response = await fetch('/api/batches');
+                    const batches = await response.json();
+                    batchesContainer.innerHTML = ''; // Clear loading message
+                    batches.forEach(batch => {
+                        const batchEl = document.createElement('div');
+                        batchEl.className = 'batch';
+                        batchEl.textContent = `Batch ${batch.id}: ${batch.ingredients.slice(0, 3).join(', ')}...`;
+                        batchEl.dataset.batchId = batch.id;
+                        batchEl.addEventListener('click', () => {
+                            loadRecipes(null, batch.id);
+                        });
+                        batchesContainer.appendChild(batchEl);
+                    });
+                } catch (error) {
+                    console.error('Failed to load batches:', error);
+                    batchesContainer.innerHTML = '<p>Could not load ingredient batches.</p>';
+                }
+            }
+
+            // Fetch and display recipes
+            async function loadRecipes(query, batchId) {
+                let url = '/api/recipes';
+                if (query) {
+                    url += `?q=${encodeURIComponent(query)}`;
+                } else if (batchId) {
+                    url += `?batch_id=${batchId}`;
+                }
+
+                try {
+                    const response = await fetch(url);
+                    const recipes = await response.json();
+                    recipesList.innerHTML = '';
+                    if (recipes.length === 0) {
+                        recipesList.innerHTML = '<li>No recipes found.</li>';
+                        return;
+                    }
+                    recipes.forEach(recipe => {
+                        const li = document.createElement('li');
+                        li.dataset.recipeId = recipe.id;
+                        
+                        const img = document.createElement('img');
+                        img.src = recipe.image_url || 'https://via.placeholder.com/100'; // Placeholder if no image
+                        li.appendChild(img);
+
+                        const title = document.createElement('span');
+                        title.textContent = recipe.title;
+                        li.appendChild(title);
+
+                        li.addEventListener('click', () => {
+                            loadRecipeDetails(recipe.id);
+                        });
+                        recipesList.appendChild(li);
+                    });
+                } catch (error) {
+                    console.error('Failed to load recipes:', error);
+                    recipesList.innerHTML = '<li>Could not load recipes.</li>';
+                }
+            }
+
+            // Fetch and display a single recipe's details
+            async function loadRecipeDetails(recipeId) {
+                try {
+                    const response = await fetch(`/api/recipe/${recipeId}`);
+                    const recipe = await response.json();
+                    
+                    recipeDetailsView.innerHTML = `
+                        <button id="back-button">Back to list</button>
+                        <h2>${recipe.title}</h2>
+                        <img src="${recipe.image_url}" alt="${recipe.title}">
+                        <h3>Ingredients</h3>
+                        <ul>
+                            ${recipe.ingredients.map(ing => `<li>${ing}</li>`).join('')}
+                        </ul>
+                        <h3>Instructions</h3>
+                        <ol>
+                            ${recipe.instructions.map(step => `<li>${step}</li>`).join('')}
+                        </ol>
+                    `;
+
+                    mainView.classList.add('hidden');
+                    recipeDetailsView.classList.remove('hidden');
+
+                    document.getElementById('back-button').addEventListener('click', () => {
+                        mainView.classList.remove('hidden');
+                        recipeDetailsView.classList.add('hidden');
+                        recipeDetailsView.innerHTML = '';
+                        recipesList.innerHTML = ''; // Clear recipe list to go back to clean slate
+                    });
+
+                } catch (error) {
+                    console.error('Failed to load recipe details:', error);
+                }
+            }
+            
+            // Event Listeners
+            searchButton.addEventListener('click', () => {
+                const query = searchInput.value;
+                if (query) {
+                    loadRecipes(query, null);
+                }
+            });
+
+            searchInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                    searchButton.click();
+                }
+            });
+
+            // Initial load
+            loadBatches();
+        });
+    </script>
+</body>
+</html> 
