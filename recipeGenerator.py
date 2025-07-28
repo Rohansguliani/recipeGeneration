@@ -35,12 +35,47 @@ def call_groq(prompt, model="llama3-70b-8192"):
     url = "https://api.groq.com/openai/v1/chat/completions"
     payload = {"messages": [{"role": "user", "content": prompt}], "model": model}
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    response = requests.post(url, headers=headers, data=json.dumps(payload))
-    if response.status_code == 200:
-        result = response.json()
-        if result.get("choices"):
-            return result["choices"][0]["message"]["content"].strip()
-    raise Exception(f"Groq API error: {response.text}")
+    
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(url, headers=headers, data=json.dumps(payload))
+            
+            # If the call is successful, parse and return the response
+            if response.status_code == 200:
+                result = response.json()
+                if result.get("choices"):
+                    return result["choices"][0]["message"]["content"].strip()
+            
+            # --- Start of new error handling logic ---
+            response_text = response.text
+            
+            # Check specifically for the rate limit error
+            if "rate_limit_exceeded" in response_text:
+                print(f"    Groq rate limit hit (Attempt {attempt + 1}/{max_retries})...")
+                
+                # Use regex to find the cooldown time, e.g., "6m5.437s"
+                match = re.search(r'try again in (?:(\d+)m)?(?:([\d.]+)s)?', response_text)
+                
+                if match:
+                    minutes = float(match.group(1)) if match.group(1) else 0
+                    seconds = float(match.group(2)) if match.group(2) else 0
+                    cooldown = (minutes * 60) + seconds + 2 # Add a 2-second buffer
+                    
+                    print(f"    Cooldown detected: {minutes}m {seconds}s. Pausing script for {cooldown:.1f} seconds...")
+                    time.sleep(cooldown)
+                    print(f"    Cooldown finished. Retrying API call...")
+                    continue # Retry the loop
+            
+            # For any other non-200 status, raise the error to be handled or logged
+            raise Exception(f"Groq API error: {response_text}")
+        
+        except requests.exceptions.RequestException as e:
+            print(f"    Network error calling Groq: {e}. Retrying in 15 seconds...")
+            time.sleep(15)
+
+    raise Exception(f"Groq API call failed after {max_retries} retries.")
+
 
 def generate_recipe_themes(count, existing_themes):
     prompt = f"""Generate {count} simple and practical recipe themes.
