@@ -38,34 +38,46 @@ class RecipeServer(http.server.SimpleHTTPRequestHandler):
         data = []
 
         try:
-            # Endpoint to get all unique batches
-            if parsed_path.path == '/api/batches':
-                batches_cursor = conn.execute('SELECT DISTINCT batch_id FROM recipes ORDER BY batch_id')
-                batches_rows = batches_cursor.fetchall()
+            # Endpoint to get filter options
+            if parsed_path.path == '/api/filters':
+                cuisine_cursor = conn.execute("SELECT DISTINCT cuisine FROM recipes WHERE cuisine != 'Unknown' ORDER BY cuisine")
+                cuisines = [row['cuisine'] for row in cuisine_cursor.fetchall()]
                 
-                for row in batches_rows:
-                    batch_id = row['batch_id']
-                    # Get a few ingredients to represent the batch
-                    ingredients_cursor = conn.execute(
-                        'SELECT ingredients_json FROM recipes WHERE batch_id = ? LIMIT 1', (batch_id,)
-                    )
-                    ingredients_row = ingredients_cursor.fetchone()
-                    if ingredients_row:
-                        ingredients = json.loads(ingredients_row['ingredients_json'])
-                        data.append({'id': batch_id, 'ingredients': ingredients})
+                dish_type_cursor = conn.execute("SELECT DISTINCT dish_type FROM recipes WHERE dish_type IS NOT NULL ORDER BY dish_type")
+                dish_types = [row['dish_type'] for row in dish_type_cursor.fetchall()]
+                
+                data = {'cuisines': cuisines, 'dish_types': dish_types}
 
-            # Endpoint to get recipes (filtered by query or batch)
+            # Endpoint to get recipes (with multiple filter options)
             elif parsed_path.path == '/api/recipes':
                 query = query_params.get('q', [None])[0]
-                batch_id = query_params.get('batch_id', [None])[0]
-                
+                cuisine = query_params.get('cuisine', [None])[0]
+                dish_type = query_params.get('dish_type', [None])[0]
+                difficulty = query_params.get('difficulty', [None])[0]
+
+                sql_query = "SELECT id, title, image_url, cuisine, difficulty, dish_type FROM recipes"
+                conditions = []
+                params = []
+
                 if query:
-                    cursor = conn.execute("SELECT id, title, image_url FROM recipes WHERE title LIKE ?", ('%' + query + '%',))
-                elif batch_id:
-                    cursor = conn.execute("SELECT id, title, image_url FROM recipes WHERE batch_id = ?", (batch_id,))
-                else:
-                    cursor = conn.execute("SELECT id, title, image_url FROM recipes")
+                    conditions.append("title LIKE ?")
+                    params.append(f"%{query}%")
+                if cuisine:
+                    conditions.append("cuisine = ?")
+                    params.append(cuisine)
+                if dish_type:
+                    conditions.append("dish_type = ?")
+                    params.append(dish_type)
+                if difficulty:
+                    conditions.append("difficulty = ?")
+                    params.append(difficulty)
                 
+                if conditions:
+                    sql_query += " WHERE " + " AND ".join(conditions)
+                
+                sql_query += " ORDER BY image_score DESC"
+                
+                cursor = conn.execute(sql_query, tuple(params))
                 rows = cursor.fetchall()
                 data = [dict(row) for row in rows]
             
