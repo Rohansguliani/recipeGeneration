@@ -18,8 +18,9 @@ PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY") # Re-adding Pixabay
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # Goal-oriented parameters
-TARGET_RECIPE_COUNT = 300
-MINIMUM_IMAGE_SCORE = 78      # The quality gate for images
+TARGET_RECIPE_COUNT = 10000  # Increased to 10,000
+MINIMUM_IMAGE_SCORE = 85  # The quality gate for images
+AUDIT_INTERVAL_HOURS = 2  # Run quality audit every 2 hours
 
 # Generation parameters
 RECIPES_PER_THEME = 10
@@ -67,12 +68,20 @@ def call_groq(prompt, model="llama3-70b-8192"):
                     print(f"    Cooldown finished. Retrying API call...")
                     continue # Retry the loop
             
+            # Check for service unavailability errors
+            if "service unavailable" in response_text.lower() or "internal_server_error" in response_text:
+                wait_time = min(30 * (2 ** attempt), 300)  # Exponential backoff: 30s, 60s, 120s, 240s, 300s max
+                print(f"    Groq service unavailable (Attempt {attempt + 1}/{max_retries}). Waiting {wait_time} seconds...")
+                time.sleep(wait_time)
+                continue
+            
             # For any other non-200 status, raise the error to be handled or logged
             raise Exception(f"Groq API error: {response_text}")
         
         except requests.exceptions.RequestException as e:
-            print(f"    Network error calling Groq: {e}. Retrying in 15 seconds...")
-            time.sleep(15)
+            wait_time = min(30 * (2 ** attempt), 300)  # Same exponential backoff for network errors
+            print(f"    Network error calling Groq: {e}. Waiting {wait_time} seconds before retry...")
+            time.sleep(wait_time)
 
     raise Exception(f"Groq API call failed after {max_retries} retries.")
 
@@ -160,6 +169,58 @@ def rate_image_with_gemini(recipe_title, image_url):
         print(f"    - Gemini: Could not rate image. Error: {e}")
         return 0 
 
+def audit_recipe_image_with_gemini(recipe_title, image_url):
+    """Use Gemini to audit how well an existing image matches its recipe"""
+    global GEMINI_IS_RATE_LIMITED, GEMINI_COOLDOWN_UNTIL
+
+    if GEMINI_IS_RATE_LIMITED and time.time() < GEMINI_COOLDOWN_UNTIL:
+        return 0
+    
+    if GEMINI_IS_RATE_LIMITED:
+        GEMINI_IS_RATE_LIMITED = False
+
+    if not GOOGLE_API_KEY:
+        return 0 
+
+    try:
+        genai.configure(api_key=GOOGLE_API_KEY)
+        
+        image_response = requests.get(image_url, stream=True)
+        if image_response.status_code != 200:
+            return 0
+        
+        image_parts = [{"mime_type": "image/jpeg", "data": image_response.content}]
+        prompt_parts = [
+            image_parts[0],
+            f"""You are a culinary expert and food photographer. Analyze this image and rate how well it represents the recipe: "{recipe_title}"
+
+Consider:
+- Visual accuracy: Does the image show the actual dish described?
+- Quality: Is the photo clear, well-lit, and appetizing?
+- Relevance: Does it match the cooking style and presentation?
+
+Rate from 0-10 where:
+10 = Perfect match, high quality, exactly what the recipe describes
+5 = Somewhat related but not ideal
+0 = Completely wrong or poor quality
+
+Return ONLY the integer score."""
+        ]
+
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content(prompt_parts)
+        
+        score = int(response.text.strip())
+        return score
+    except Exception as e:
+        error_str = str(e).lower()
+        if "429" in error_str and "quota" in error_str:
+            print("\n    !!!! Gemini daily rate limit reached during audit. Disabling AI scoring for 1 hour. !!!!\n")
+            GEMINI_IS_RATE_LIMITED = True
+            GEMINI_COOLDOWN_UNTIL = time.time() + 3600
+            return 0
+
+        return 0
 
 # --- Image Searching & Scoring Engine ---
 
@@ -326,6 +387,57 @@ def insert_recipe(cursor, recipe_data):
         VALUES (:title, :description, :cuisine, :difficulty, :dish_type, :ingredients_json, :instructions_json, :image_url, :image_score, :theme)
     ''', recipe_data)
 
+def audit_database_quality(conn, cursor):
+    """Audit all recipes in the database and replace poor images"""
+    print(f"\n=== STARTING DATABASE QUALITY AUDIT ===")
+    
+    # Get all recipes
+    cursor.execute("SELECT id, title, image_url FROM recipes ORDER BY id")
+    recipes = cursor.fetchall()
+    
+    replacements_made = 0
+    
+    for recipe in recipes:
+        recipe_id, title, current_image_url = recipe['id'], recipe['title'], recipe['image_url']
+        
+        print(f"\nAuditing Recipe {recipe_id}: {title}")
+        
+        # Get current used URLs to avoid duplicates, but exclude this recipe's current image
+        cursor.execute("SELECT image_url FROM recipes WHERE id != ?", (recipe_id,))
+        used_urls = {row['image_url'] for row in cursor.fetchall()}
+        
+        # Audit current image
+        current_score = audit_recipe_image_with_gemini(title, current_image_url)
+        print(f"  Current image score: {current_score}/10")
+        
+        if current_score < 5:
+            print(f"  Score too low ({current_score}/10). Searching for better image...")
+            
+            # Try to find a better image (excluding all other recipes' images)
+            new_image_url, new_score, _ = find_best_image(title, used_urls)
+            
+            if new_image_url and new_score > current_score:
+                # Update the database with the better image
+                cursor.execute("UPDATE recipes SET image_url = ?, image_score = ? WHERE id = ?", 
+                             (new_image_url, new_score, recipe_id))
+                conn.commit()
+                replacements_made += 1
+                print(f"  ✓ Replaced with better image (Score: {new_score}/10)")
+                
+                # Update our used_urls set to include the new image and remove the old one
+                used_urls.discard(current_image_url)  # Remove old image
+                used_urls.add(new_image_url)          # Add new image
+            else:
+                print(f"  ✗ Could not find better image")
+        else:
+            print(f"  ✓ Current image is good enough (Score: {current_score}/10)")
+        
+        time.sleep(1)  # Be gentle on APIs during audit
+    
+    print(f"\n=== AUDIT COMPLETE ===")
+    print(f"Replaced {replacements_made} poor images out of {len(recipes)} recipes.")
+    return replacements_made
+
 # --- Main Control Loop ---
 
 def main():
@@ -348,8 +460,22 @@ def main():
         print(f"--- Starting Quality-Gated Recipe Generation ---")
 
     print(f"Goal: Collect {TARGET_RECIPE_COUNT} recipes with an image score of {MINIMUM_IMAGE_SCORE} or higher.")
+    print(f"Quality audits will run every {AUDIT_INTERVAL_HOURS} hours.")
+    
+    last_audit_time = time.time()
     
     while current_recipe_count < TARGET_RECIPE_COUNT:
+        current_time = time.time()
+        
+        # Check if it's time for a quality audit
+        if current_time - last_audit_time >= (AUDIT_INTERVAL_HOURS * 3600):
+            audit_database_quality(conn, cursor)
+            last_audit_time = current_time
+            
+            # Refresh used URLs after audit
+            cursor.execute("SELECT image_url FROM recipes")
+            used_image_urls = {row['image_url'] for row in cursor.fetchall()}
+        
         print(f"\n--- Progress: {current_recipe_count} / {TARGET_RECIPE_COUNT} ---")
         
         # 1. Generate new, unique themes
@@ -392,13 +518,13 @@ def main():
                         "theme": theme
                     }
                     insert_recipe(cursor, recipe_data)
-                    used_image_urls.add(image_url) # Add to our set of used URLs
+                    used_image_urls.add(image_url)
                     conn.commit()
-                    current_recipe_count += 1 # Increment our counter
+                    current_recipe_count += 1
                 else:
                     print(f"  --> SKIPPED. Recipe '{title}' did not meet quality gate (Score: {score}) or no unique image was found.")
                 
-                time.sleep(2) # Increased sleep to be gentler on APIs
+                time.sleep(2)
             
     conn.close()
     print(f"\n--- Generation Complete! ---")
