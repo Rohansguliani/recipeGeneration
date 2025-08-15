@@ -16,6 +16,7 @@ PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY")
 PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY") # Re-adding Pixabay
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+SHUTTERSTOCK_TOKEN = os.getenv("SHUTTERSTOCK_TOKEN")
 
 # Goal-oriented parameters
 TARGET_RECIPE_COUNT = 10000  # Increased to 10,000
@@ -25,6 +26,8 @@ AUDIT_INTERVAL_HOURS = 2  # Run quality audit every 2 hours
 # Generation parameters
 RECIPES_PER_THEME = 10
 CANDIDATE_IMAGE_COUNT = 7
+# Ensure each provider returns between 5 and 10 candidates
+CANDIDATES_PER_PROVIDER = max(5, min(10, CANDIDATE_IMAGE_COUNT))
 
 # Image constraints
 MIN_IMAGE_WIDTH = 800
@@ -123,38 +126,48 @@ Output as a single JSON array. No extra text."""
 GEMINI_IS_RATE_LIMITED = False
 GEMINI_COOLDOWN_UNTIL = 0
 
-def rate_image_with_gemini(recipe_title, image_url):
+
+def rate_image_with_gemini(recipe_title, image_url, dish_type=None):
     global GEMINI_IS_RATE_LIMITED, GEMINI_COOLDOWN_UNTIL
 
     if GEMINI_IS_RATE_LIMITED and time.time() < GEMINI_COOLDOWN_UNTIL:
-        # We are still in the cooldown period, don't make an API call
         return 0
-    
-    # If the cooldown has passed, reset the flag
+
     if GEMINI_IS_RATE_LIMITED:
         GEMINI_IS_RATE_LIMITED = False
 
     if not GOOGLE_API_KEY:
-        return 0 
+        return 0
 
     try:
         genai.configure(api_key=GOOGLE_API_KEY)
-        
-        # Download the image to send to the API
+
         image_response = requests.get(image_url, stream=True)
         if image_response.status_code != 200:
             print(f"    - Gemini: Failed to download image {image_url}")
             return 0
-        
+
         image_parts = [{"mime_type": "image/jpeg", "data": image_response.content}]
-        prompt_parts = [
-            image_parts[0],
-            f"\nRate how well this image matches the recipe title '{recipe_title}' on a scale from 0 to 10. Consider accuracy and visual appeal. Return ONLY the integer score.",
-        ]
+        rules = (
+            "You are a strict food photo judge. Rate how well this image matches the dish '"
+            + recipe_title
+            + "'.\n"
+            "Rules:\n"
+            "- Prefer a realistic, appetizing, plated, cooked dish.\n"
+            "- Do NOT show product packaging (cans, jars, boxes), logos/labels, menus, or obvious stock mockups.\n"
+            "- Do NOT show a photo of only packaged food or a can; that should be rated 0.\n"
+            "- Avoid illustrations, clipart, or cartoons; rate 0 if detected.\n"
+            "- Avoid purely raw ingredients unless the dish itself is a raw preparation.\n"
+        )
+        if dish_type == "soup":
+            rules += "- If the dish is soup and the image shows a can of soup or packaged soup, rate 0.\n"
+        rules += "Return ONLY an integer from 0 to 10."
+
+        prompt_parts = [image_parts[0], rules]
 
         model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content(prompt_parts)
-        
+
         score = int(response.text.strip())
         print(f"    - Gemini Likeness Score: {score}/10")
         return score
@@ -164,10 +177,11 @@ def rate_image_with_gemini(recipe_title, image_url):
             print("\n    !!!! Gemini daily rate limit reached. Disabling AI scoring for 1 hour. !!!!\n")
             GEMINI_IS_RATE_LIMITED = True
             GEMINI_COOLDOWN_UNTIL = time.time() + 3600
-            return 0 # Return neutral score
+            return 0
 
         print(f"    - Gemini: Could not rate image. Error: {e}")
-        return 0 
+        return 0
+
 
 def audit_recipe_image_with_gemini(recipe_title, image_url):
     """Use Gemini to audit how well an existing image matches its recipe"""
@@ -175,41 +189,38 @@ def audit_recipe_image_with_gemini(recipe_title, image_url):
 
     if GEMINI_IS_RATE_LIMITED and time.time() < GEMINI_COOLDOWN_UNTIL:
         return 0
-    
+
     if GEMINI_IS_RATE_LIMITED:
         GEMINI_IS_RATE_LIMITED = False
 
     if not GOOGLE_API_KEY:
-        return 0 
+        return 0
 
     try:
         genai.configure(api_key=GOOGLE_API_KEY)
-        
+
         image_response = requests.get(image_url, stream=True)
         if image_response.status_code != 200:
             return 0
-        
+
         image_parts = [{"mime_type": "image/jpeg", "data": image_response.content}]
-        prompt_parts = [
-            image_parts[0],
-            f"""You are a culinary expert and food photographer. Analyze this image and rate how well it represents the recipe: "{recipe_title}"
+        dish_type = next((dish for dish in DISH_TYPES if dish in recipe_title.lower()), None)
+        prompt_text = (
+            "You are a culinary expert and food photographer. Analyze this image and rate how well it represents the recipe: '"
+            + recipe_title
+            + "'.\n"
+            "Consider: accuracy, quality, relevance. Prefer a plated, cooked dish.\n"
+            "Hard penalties (rate 0) for: product packaging (cans, jars, boxes), logos/labels, menus, illustrations, or obvious stock mockups.\n"
+        )
+        if dish_type == "soup":
+            prompt_text += "If the dish is soup and the image shows a can of soup or packaged soup, rate 0.\n"
+        prompt_text += "Return ONLY an integer from 0 to 10."
 
-Consider:
-- Visual accuracy: Does the image show the actual dish described?
-- Quality: Is the photo clear, well-lit, and appetizing?
-- Relevance: Does it match the cooking style and presentation?
-
-Rate from 0-10 where:
-10 = Perfect match, high quality, exactly what the recipe describes
-5 = Somewhat related but not ideal
-0 = Completely wrong or poor quality
-
-Return ONLY the integer score."""
-        ]
+        prompt_parts = [image_parts[0], prompt_text]
 
         model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content(prompt_parts)
-        
+
         score = int(response.text.strip())
         return score
     except Exception as e:
@@ -232,6 +243,22 @@ DISH_TYPES = [
     "roast", "grilled", "baked", "fried", "bites", "wings", "cake"
 ]
 
+NEGATIVE_PACKAGING_KEYWORDS = {
+    "can", "canned", "tin", "tinned", "jar", "boxed", "box", "packaging",
+    "package", "label", "logo", "brand", "wrapper", "carton", "bottle", "can of"
+}
+NEGATIVE_NON_FOOD_VISUALS = {"illustration", "vector", "clipart", "cartoon", "icon", "graphic", "logo"}
+
+
+def is_packaging_or_non_food(metadata_str: str, dish_type: str | None) -> bool:
+    text = str(metadata_str).lower()
+    has_packaging = any(k in text for k in NEGATIVE_PACKAGING_KEYWORDS)
+    has_non_food = any(k in text for k in NEGATIVE_NON_FOOD_VISUALS)
+    if dish_type == "soup" and ("can of soup" in text or ("soup" in text and "can" in text)):
+        return True
+    return has_packaging or has_non_food
+
+
 def score_image(recipe_title, image_metadata, dish_type, image_url):
     # 1. Heuristic Score (fast, keyword-based)
     heuristic_score = 0
@@ -243,32 +270,37 @@ def score_image(recipe_title, image_metadata, dish_type, image_url):
         heuristic_score += 50
         if metadata_str.find(dish_type) < 50:
             heuristic_score += 15
-    
+
     primary_ingredients = set(title_lower.replace(dish_type, "").split()) if dish_type else title_words
     for ingredient in primary_ingredients:
         if ingredient in metadata_str:
             heuristic_score += 10
-    
+
     metadata_words = set(re.findall(r'\w+', metadata_str))
     heuristic_score += len(title_words.intersection(metadata_words)) * 2
 
     if dish_type == "cake" and any(w in title_lower for w in ["chicken", "beef", "fish", "savory"]):
         if "dessert" in metadata_str or "sweet" in metadata_str:
             heuristic_score -= 100
-    
+
     if 'food' in metadata_words and len(metadata_words) < 5:
         heuristic_score -= 10
 
+    # Penalize product packaging or non-food depictions
+    if is_packaging_or_non_food(metadata_str, dish_type):
+        heuristic_score -= 100
+
     # 2. AI Vision Score (slower, more accurate)
     # The AI's 0-10 score is weighted heavily
-    ai_score = rate_image_with_gemini(recipe_title, image_url) * 10 
-    
+    ai_score = rate_image_with_gemini(recipe_title, image_url, dish_type) * 10
+
     # Return the combined score
     return heuristic_score + ai_score
 
 UNSPLASH_REQUESTS_COUNT = 0
 UNSPLASH_RATE_LIMIT = 50
 LAST_UNSPLASH_REQUEST_TIME = time.time()
+
 
 def can_use_unsplash():
     global UNSPLASH_REQUESTS_COUNT, LAST_UNSPLASH_REQUEST_TIME
@@ -277,92 +309,140 @@ def can_use_unsplash():
         LAST_UNSPLASH_REQUEST_TIME = time.time()
     return UNSPLASH_REQUESTS_COUNT < UNSPLASH_RATE_LIMIT
 
-def find_best_image(title, used_urls):
+
+def find_best_image(title, used_urls, allow_below_threshold: bool = False, min_score: int | None = None):
     print(f"\n--- Finding image for: {title} ---")
     dish_type = next((dish for dish in DISH_TYPES if dish in title.lower()), None)
     search_query = f'food photography "{title}"'
 
-    # --- API Provider Fallback Loop ---
-    api_providers = ["Unsplash", "Pexels", "Pixabay"]
+    all_candidates = []
 
-    for provider in api_providers:
-        print(f"  Trying provider: {provider}...")
-        candidates = []
-
-        # 1. Gather candidates from the current provider
-        if provider == "Unsplash" and UNSPLASH_ACCESS_KEY and can_use_unsplash():
-            global UNSPLASH_REQUESTS_COUNT
-            url = f"https://api.unsplash.com/search/photos?query={search_query}&per_page={CANDIDATE_IMAGE_COUNT}&orientation=landscape"
+    # Unsplash
+    if UNSPLASH_ACCESS_KEY and can_use_unsplash():
+        global UNSPLASH_REQUESTS_COUNT
+        try:
+            url = (
+                f"https://api.unsplash.com/search/photos?query={search_query}"
+                f"&per_page={CANDIDATES_PER_PROVIDER}&orientation=landscape"
+            )
             headers = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}
-            try:
-                response = requests.get(url, headers=headers)
-                UNSPLASH_REQUESTS_COUNT += 1
-                if response.status_code == 200:
-                    for img in response.json().get("results", []):
-                        if img["width"] >= MIN_IMAGE_WIDTH:
-                            candidates.append({"url": img["urls"]["regular"], "metadata": f"{img.get('description', '')} {img.get('alt_description', '')}", "source": "Unsplash"})
-            except Exception as e:
-                print(f"    Warning: Unsplash request failed: {e}")
+            response = requests.get(url, headers=headers)
+            UNSPLASH_REQUESTS_COUNT += 1
+            if response.status_code == 200:
+                for img in response.json().get("results", []):
+                    if img.get("width", 0) >= MIN_IMAGE_WIDTH:
+                        metadata = f"{img.get('description', '')} {img.get('alt_description', '')}"
+                        all_candidates.append({
+                            "url": img["urls"]["regular"],
+                            "metadata": metadata,
+                            "source": "Unsplash",
+                        })
+        except Exception as e:
+            print(f"    Warning: Unsplash request failed: {e}")
 
-        elif provider == "Pexels" and PEXELS_API_KEY:
-            url = f"https://api.pexels.com/v1/search?query={search_query}&per_page={CANDIDATE_IMAGE_COUNT}"
+    # Pexels
+    if PEXELS_API_KEY:
+        try:
+            url = f"https://api.pexels.com/v1/search?query={search_query}&per_page={CANDIDATES_PER_PROVIDER}"
             headers = {"Authorization": PEXELS_API_KEY}
-            try:
-                response = requests.get(url, headers=headers)
-                if response.status_code == 200:
-                    for img in response.json().get("photos", []):
-                        if img["width"] >= MIN_IMAGE_WIDTH:
-                            candidates.append({"url": img["src"]["large2x"], "metadata": img.get('alt', ''), "source": "Pexels"})
-            except Exception as e:
-                print(f"    Warning: Pexels request failed: {e}")
-        
-        elif provider == "Pixabay" and PIXABAY_API_KEY:
-            url = f"https://pixabay.com/api/?key={PIXABAY_API_KEY}&q={search_query}&per_page={CANDIDATE_IMAGE_COUNT}&image_type=photo"
-            try:
-                response = requests.get(url)
-                if response.status_code == 200:
-                    for img in response.json().get("hits", []):
-                        if img["imageWidth"] >= MIN_IMAGE_WIDTH:
-                            candidates.append({"url": img["largeImageURL"], "metadata": img.get('tags', ''), "source": "Pixabay"})
-            except Exception as e:
-                print(f"    Warning: Pixabay request failed: {e}")
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                for img in response.json().get("photos", []):
+                    if img.get("width", 0) >= MIN_IMAGE_WIDTH:
+                        all_candidates.append({
+                            "url": img["src"]["large2x"],
+                            "metadata": img.get("alt", ""),
+                            "source": "Pexels",
+                        })
+        except Exception as e:
+            print(f"    Warning: Pexels request failed: {e}")
 
-        # 2. Score candidates and check against quality gate
-        if candidates:
-            scored_candidates = []
-            for cand in candidates:
-                # Pass the image URL to the scoring function now
-                score = score_image(title, cand["metadata"], dish_type, cand["url"])
-                scored_candidates.append({"score": score, "candidate": cand})
+    # Pixabay
+    if PIXABAY_API_KEY:
+        try:
+            url = (
+                f"https://pixabay.com/api/?key={PIXABAY_API_KEY}&q={search_query}"
+                f"&per_page={CANDIDATES_PER_PROVIDER}&image_type=photo&orientation=horizontal"
+            )
+            response = requests.get(url)
+            if response.status_code == 200:
+                for img in response.json().get("hits", []):
+                    if img.get("imageWidth", 0) >= MIN_IMAGE_WIDTH:
+                        all_candidates.append({
+                            "url": img["largeImageURL"],
+                            "metadata": img.get("tags", ""),
+                            "source": "Pixabay",
+                        })
+        except Exception as e:
+            print(f"    Warning: Pixabay request failed: {e}")
 
-            sorted_candidates = sorted(scored_candidates, key=lambda x: x['score'], reverse=True)
+    # Shutterstock
+    if SHUTTERSTOCK_TOKEN:
+        try:
+            url = (
+                f"https://api.shutterstock.com/v2/images/search?query={search_query}"
+                f"&per_page={CANDIDATES_PER_PROVIDER}&orientation=horizontal"
+            )
+            headers = {"Authorization": f"Bearer {SHUTTERSTOCK_TOKEN}"}
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                for img in response.json().get("data", []):
+                    assets = img.get("assets", {})
+                    chosen = None
+                    for key in ("preview_1000", "preview", "huge_thumb"):
+                        if key in assets and assets[key].get("url"):
+                            chosen = assets[key]
+                            break
+                    if chosen and chosen.get("width", 0) >= MIN_IMAGE_WIDTH:
+                        metadata = img.get("description", "")
+                        if isinstance(img.get("keywords"), list):
+                            metadata = f"{metadata} {' '.join(img['keywords'])}"
+                        all_candidates.append({
+                            "url": chosen.get("url"),
+                            "metadata": metadata,
+                            "source": "Shutterstock",
+                        })
+        except Exception as e:
+            print(f"    Warning: Shutterstock request failed: {e}")
 
-            # Find the best unique image from this provider's results
-            for sc in sorted_candidates:
-                if sc['candidate']['url'] not in used_urls:
-                    # Quality Gate Check
-                    if sc['score'] >= MINIMUM_IMAGE_SCORE:
-                        print(f"    SUCCESS! Found high-quality image on {provider} with score {sc['score']}.")
-                        print(f"    --> {sc['candidate']['url']}")
-                        return sc['candidate']['url'], sc['score'], dish_type
-                    else:
-                        # The best available image from this provider is not good enough
-                        print(f"    Provider {provider} did not meet quality gate. Best score was {sc['score']}.")
-                        break # Stop checking this provider's images and move to the next provider
-        else:
-            print(f"    No results from {provider}.")
-    
-    # If the loop finishes, no suitable image was found
-    print(f"  --> All providers failed to find a unique, high-quality image for '{title}'.")
+    if not all_candidates:
+        print("    No results from any provider.")
+        print(f"  --> All providers failed to find a unique, high-quality image for '{title}'.")
+        return None, 0, dish_type
+
+    scored_candidates = []
+    for cand in all_candidates:
+        if cand["url"] in used_urls:
+            continue
+        score = score_image(title, cand["metadata"], dish_type, cand["url"])
+        scored_candidates.append({"score": score, "candidate": cand})
+
+    if not scored_candidates:
+        print("    All candidate URLs are already used or invalid.")
+        return None, 0, dish_type
+
+    sorted_candidates = sorted(scored_candidates, key=lambda x: x["score"], reverse=True)
+    best = sorted_candidates[0]
+    threshold = MINIMUM_IMAGE_SCORE if min_score is None else int(min_score)
+    if best["score"] >= threshold:
+        print(f"    SUCCESS! Best image from {best['candidate']['source']} scored {best['score']}.")
+        print(f"    --> {best['candidate']['url']}")
+        return best["candidate"]["url"], best["score"], dish_type
+
+    if allow_below_threshold:
+        print(f"    Using best available below threshold ({best['score']}). Source: {best['candidate']['source']}")
+        print(f"    --> {best['candidate']['url']}")
+        return best["candidate"]["url"], best["score"], dish_type
+
+    print(f"    No candidate met the quality gate. Best score was {best['score']} from {best['candidate']['source']}.")
     return None, 0, dish_type
 
 # --- Database Functions ---
 
 def setup_db():
     conn = sqlite3.connect('recipes.db')
-    conn.row_factory = sqlite3.Row # Allows accessing columns by name
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    # cursor.execute('DROP TABLE IF EXISTS recipes') # Removed to make script resumable
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS recipes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -375,17 +455,151 @@ def setup_db():
             instructions_json TEXT,
             image_url TEXT,
             image_score INTEGER,
-            theme TEXT
+            theme TEXT,
+            nutrition_json TEXT,
+            vegan INTEGER DEFAULT 0,
+            vegetarian INTEGER DEFAULT 0,
+            gluten_free INTEGER DEFAULT 0,
+            dairy_free INTEGER DEFAULT 0,
+            nut_free INTEGER DEFAULT 0,
+            keto_friendly INTEGER DEFAULT 0
         )
     ''')
     conn.commit()
+
+    # Apply schema migrations for existing tables missing columns
+    apply_schema_migrations(conn, cursor)
+
     return conn, cursor
+
+
+def apply_schema_migrations(conn: sqlite3.Connection, cursor: sqlite3.Cursor) -> None:
+    cursor.execute("PRAGMA table_info(recipes)")
+    columns = {row[1] for row in cursor.fetchall()}
+    add_columns_sql = []
+    if 'nutrition_json' not in columns:
+        add_columns_sql.append("ALTER TABLE recipes ADD COLUMN nutrition_json TEXT")
+    if 'vegan' not in columns:
+        add_columns_sql.append("ALTER TABLE recipes ADD COLUMN vegan INTEGER DEFAULT 0")
+    if 'vegetarian' not in columns:
+        add_columns_sql.append("ALTER TABLE recipes ADD COLUMN vegetarian INTEGER DEFAULT 0")
+    if 'gluten_free' not in columns:
+        add_columns_sql.append("ALTER TABLE recipes ADD COLUMN gluten_free INTEGER DEFAULT 0")
+    if 'dairy_free' not in columns:
+        add_columns_sql.append("ALTER TABLE recipes ADD COLUMN dairy_free INTEGER DEFAULT 0")
+    if 'nut_free' not in columns:
+        add_columns_sql.append("ALTER TABLE recipes ADD COLUMN nut_free INTEGER DEFAULT 0")
+    if 'keto_friendly' not in columns:
+        add_columns_sql.append("ALTER TABLE recipes ADD COLUMN keto_friendly INTEGER DEFAULT 0")
+
+    for sql in add_columns_sql:
+        try:
+            cursor.execute(sql)
+            conn.commit()
+        except sqlite3.OperationalError:
+            # Column may already exist due to race; ignore
+            pass
+
 
 def insert_recipe(cursor, recipe_data):
     cursor.execute('''
-        INSERT INTO recipes (title, description, cuisine, difficulty, dish_type, ingredients_json, instructions_json, image_url, image_score, theme)
-        VALUES (:title, :description, :cuisine, :difficulty, :dish_type, :ingredients_json, :instructions_json, :image_url, :image_score, :theme)
+        INSERT INTO recipes (
+            title, description, cuisine, difficulty, dish_type,
+            ingredients_json, instructions_json, image_url, image_score, theme,
+            nutrition_json, vegan, vegetarian, gluten_free, dairy_free, nut_free, keto_friendly
+        )
+        VALUES (
+            :title, :description, :cuisine, :difficulty, :dish_type,
+            :ingredients_json, :instructions_json, :image_url, :image_score, :theme,
+            :nutrition_json, :vegan, :vegetarian, :gluten_free, :dairy_free, :nut_free, :keto_friendly
+        )
     ''', recipe_data)
+
+
+def estimate_nutrition(ingredients: list, title: str) -> dict:
+    """Estimate nutrition per serving using LLM. Returns dict with common fields.
+    Fallbacks to zeros on parse errors.
+    """
+    base = {
+        "calories": 0,
+        "protein_g": 0,
+        "carbs_g": 0,
+        "fat_g": 0,
+        "fiber_g": 0,
+        "sugar_g": 0,
+        "saturated_fat_g": 0,
+        "cholesterol_mg": 0,
+        "sodium_mg": 0
+    }
+
+    try:
+        prompt = (
+            "Estimate nutrition for this recipe per serving. Return ONLY compact JSON with keys: "
+            "calories, protein_g, carbs_g, fat_g, fiber_g, sugar_g, saturated_fat_g, cholesterol_mg, sodium_mg.\n"
+            f"Title: {title}\nIngredients: {json.dumps(ingredients)}"
+        )
+        response = call_groq(prompt, model="llama3-8b-8192")
+        text = response.strip().replace("```json", "").replace("```", "").strip()
+        data = json.loads(text)
+        # Merge to ensure all keys exist and are numeric
+        for k in base.keys():
+            v = data.get(k, 0)
+            try:
+                base[k] = float(v)
+            except Exception:
+                base[k] = 0
+    except Exception:
+        pass
+    return base
+
+
+def classify_dietary_flags(ingredients: list, title: str) -> dict:
+    """Classify dietary booleans using LLM, with simple heuristics fallback."""
+    default_flags = {
+        "vegan": False,
+        "vegetarian": False,
+        "gluten_free": False,
+        "dairy_free": False,
+        "nut_free": False,
+        "keto_friendly": False,
+    }
+
+    try:
+        prompt = (
+            "Given a recipe title and ingredients, answer ONLY JSON booleans for: "
+            "vegan, vegetarian, gluten_free, dairy_free, nut_free, keto_friendly.\n"
+            "Assume typical substitutions are not used unless stated.\n"
+            f"Title: {title}\nIngredients: {json.dumps(ingredients)}"
+        )
+        text = call_groq(prompt, model="llama3-8b-8192").strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(text)
+        flags = {k: bool(data.get(k, False)) for k in default_flags.keys()}
+        return flags
+    except Exception:
+        # Heuristic fallback
+        ing_text = " ".join(map(str, ingredients)).lower()
+        meats = ["beef", "pork", "chicken", "turkey", "fish", "shrimp", "bacon", "sausage", "ham"]
+        dairy_terms = ["milk", "cheese", "butter", "yogurt", "cream", "ghee"]
+        gluten_terms = ["wheat", "flour", "bread", "pasta", "noodle", "barley", "rye", "cracker"]
+        nuts = ["almond", "peanut", "walnut", "pecan", "cashew", "hazelnut", "pistachio"]
+
+        has_meat = any(m in ing_text for m in meats)
+        has_dairy = any(d in ing_text for d in dairy_terms)
+        has_gluten = any(g in ing_text for g in gluten_terms)
+        has_nuts = any(n in ing_text for n in nuts)
+
+        default_flags["vegan"] = not has_meat and not has_dairy and "egg" not in ing_text and "honey" not in ing_text
+        default_flags["vegetarian"] = not has_meat
+        default_flags["dairy_free"] = not has_dairy
+        default_flags["gluten_free"] = not has_gluten
+        default_flags["nut_free"] = not has_nuts
+        # crude keto-friendly: low-carb keywords
+        default_flags["keto_friendly"] = (
+            default_flags["vegan"] is False and not any(w in ing_text for w in ["sugar", "flour", "rice", "potato"]) and has_meat
+        )
+        return default_flags
+
 
 def audit_database_quality(conn, cursor):
     """Audit all recipes in the database and replace poor images"""
@@ -502,6 +716,11 @@ def main():
                     continue
 
                 image_url, score, dish_type = find_best_image(title, used_image_urls)
+
+                # Nutrition and flags
+                ingredients_list = recipe.get('ingredients', [])
+                nutrition = estimate_nutrition(ingredients_list, title)
+                flags = classify_dietary_flags(ingredients_list, title)
                 
                 if image_url and score >= MINIMUM_IMAGE_SCORE:
                     print(f"  --> SUCCESS! Recipe '{title}' passed quality gate with score {score}.")
@@ -511,11 +730,18 @@ def main():
                         "cuisine": recipe.get('cuisine', 'Unknown'),
                         "difficulty": recipe.get('difficulty', 'Unknown'),
                         "dish_type": dish_type,
-                        "ingredients_json": json.dumps(recipe.get('ingredients', [])),
+                        "ingredients_json": json.dumps(ingredients_list),
                         "instructions_json": json.dumps(recipe.get('instructions', [])),
                         "image_url": image_url,
                         "image_score": score,
-                        "theme": theme
+                        "theme": theme,
+                        "nutrition_json": json.dumps(nutrition),
+                        "vegan": 1 if flags.get('vegan') else 0,
+                        "vegetarian": 1 if flags.get('vegetarian') else 0,
+                        "gluten_free": 1 if flags.get('gluten_free') else 0,
+                        "dairy_free": 1 if flags.get('dairy_free') else 0,
+                        "nut_free": 1 if flags.get('nut_free') else 0,
+                        "keto_friendly": 1 if flags.get('keto_friendly') else 0,
                     }
                     insert_recipe(cursor, recipe_data)
                     used_image_urls.add(image_url)
